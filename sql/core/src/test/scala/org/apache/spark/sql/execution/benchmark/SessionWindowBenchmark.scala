@@ -61,10 +61,10 @@ object SessionWindowBenchmark extends SqlBasedBenchmark {
   }
 
   private def runSessionWindow(numOfRow: Int): Unit = {
-//    spark.range(numOfRow)
-//      .selectExpr("CAST(id AS timestamp) AS time")
-//      .select(session_window(col("time"), "10 seconds"))
-//      .count()
+    spark.range(numOfRow)
+      .selectExpr("CAST(id AS timestamp) AS time")
+      .select(session_window(col("time"), "10 seconds"))
+      .count()
 
     spark.range(numOfRow)
       .selectExpr("CAST(id AS timestamp) AS time")
