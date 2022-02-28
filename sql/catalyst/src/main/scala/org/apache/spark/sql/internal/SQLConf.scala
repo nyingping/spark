@@ -1625,6 +1625,12 @@ object SQLConf {
     .stringConf
     .createOptional
 
+  val SESSION_WINDOW_NEW_LOGIC =
+    buildConf("spark.sql.streaming.sessionWindow.apply.new.logic")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val FORCE_DELETE_TEMP_CHECKPOINT_LOCATION =
     buildConf("spark.sql.streaming.forceDeleteTempCheckpointLocation")
       .doc("When true, enable temporary checkpoint locations force delete.")

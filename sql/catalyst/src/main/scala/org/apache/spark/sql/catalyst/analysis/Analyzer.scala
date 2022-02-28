@@ -52,7 +52,7 @@ import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTrans
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy}
+import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy, SESSION_WINDOW_NEW_LOGIC}
 import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType.DAY
@@ -3965,6 +3965,9 @@ object SessionWindowing extends Rule[LogicalPlan] {
   private final val SESSION_START = "start"
   private final val SESSION_END = "end"
 
+  def apply(plan: LogicalPlan): LogicalPlan =
+    apply0(plan, plan.conf.getConf(SESSION_WINDOW_NEW_LOGIC))
+
   /**
    * Generates the logical plan for generating session window on a timestamp column.
    * Each session window is initially defined as [timestamp, timestamp + gap).
@@ -3972,7 +3975,8 @@ object SessionWindowing extends Rule[LogicalPlan] {
    * This also adds a marker to the session column so that downstream can easily find the column
    * on session window.
    */
-  def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+  def apply0(plan: LogicalPlan,
+            useNewLogic: Boolean): LogicalPlan = plan.resolveOperatorsUp {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head
       val sessionExpressions =
@@ -4034,12 +4038,34 @@ object SessionWindowing extends Rule[LogicalPlan] {
 
         // As same as tumbling window, we add a filter to filter out nulls.
         // And we also filter out events with negative or zero gap duration.
-        val filterExpr = IsNotNull(session.timeColumn) &&
-          (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+        if (useNewLogic) {
+          val children = gapDuration.child.children
+          val validGapDuration = if (children.size == 0) {
+            gapDuration.child.toString.startsWith("-") ||
+              gapDuration.child.toString.startsWith("0")
+          } else {
+            children.toStream.exists(e =>
+              e.toString.startsWith("-") || e.toString.startsWith("0")) ||
+              // User defined functions are not resolved here
+              gapDuration.child.getField("udfName").child != null
+          }
+          val filterExpr = if (validGapDuration) {
+            IsNotNull(session.timeColumn) &&
+              (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+          } else {
+            IsNotNull(session.timeColumn)
+          }
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        } else {
+          val filterExpr = IsNotNull(session.timeColumn) &&
+            (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        }
 
-        replacedPlan.withNewChildren(
-          Filter(filterExpr,
-            Project(sessionStruct +: child.output, child)) :: Nil)
       } else if (numWindowExpr > 1) {
         throw QueryCompilationErrors.multiTimeWindowExpressionsNotSupportedError(p)
       } else {
