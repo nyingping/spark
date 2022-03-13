@@ -1649,6 +1649,12 @@ object SQLConf {
     .intConf
     .createWithDefault(2)
 
+  val SESSION_WINDOW_NEW_LOGIC =
+    buildConf("spark.sql.streaming.sessionWindow.apply.new.logic")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val STREAMING_MAINTENANCE_INTERVAL =
     buildConf("spark.sql.streaming.stateStore.maintenanceInterval")
       .internal()

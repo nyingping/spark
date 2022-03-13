@@ -21,14 +21,12 @@ import java.lang.reflect.{Method, Modifier}
 import java.util
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.{Failure, Random, Success, Try}
-
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst._
-import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer.{extraHintForAnsiTypeCoercionExpression, DATA_TYPE_MISMATCH_ERROR}
+import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer.{DATA_TYPE_MISMATCH_ERROR, extraHintForAnsiTypeCoercionExpression}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.encoders.OuterScopes
 import org.apache.spark.sql.catalyst.expressions.{Expression, FrameLessOffsetWindowFunction, _}
@@ -42,17 +40,17 @@ import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.catalyst.trees.{AlwaysProcess, CurrentOrigin}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
-import org.apache.spark.sql.catalyst.util.{toPrettySQL, CharVarcharUtils}
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, IntervalUtils, toPrettySQL}
 import org.apache.spark.sql.connector.catalog._
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 import org.apache.spark.sql.connector.catalog.TableChange.{After, ColumnPosition}
-import org.apache.spark.sql.connector.catalog.functions.{AggregateFunction => V2AggregateFunction, BoundFunction, ScalarFunction, UnboundFunction}
+import org.apache.spark.sql.connector.catalog.functions.{BoundFunction, ScalarFunction, UnboundFunction, AggregateFunction => V2AggregateFunction}
 import org.apache.spark.sql.connector.catalog.functions.ScalarFunction.MAGIC_METHOD_NAME
 import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTransform, Transform}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy}
+import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, SESSION_WINDOW_NEW_LOGIC, StoreAssignmentPolicy}
 import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType.DAY
@@ -3965,6 +3963,9 @@ object SessionWindowing extends Rule[LogicalPlan] {
   private final val SESSION_START = "start"
   private final val SESSION_END = "end"
 
+  def apply(plan: LogicalPlan): LogicalPlan =
+    apply0(plan, plan.conf.getConf(SESSION_WINDOW_NEW_LOGIC))
+
   /**
    * Generates the logical plan for generating session window on a timestamp column.
    * Each session window is initially defined as [timestamp, timestamp + gap).
@@ -3972,7 +3973,8 @@ object SessionWindowing extends Rule[LogicalPlan] {
    * This also adds a marker to the session column so that downstream can easily find the column
    * on session window.
    */
-  def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+  def apply0(plan: LogicalPlan,
+             useNewLogic: Boolean): LogicalPlan = plan.resolveOperatorsUp {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head
       val sessionExpressions =
@@ -4032,14 +4034,44 @@ object SessionWindowing extends Rule[LogicalPlan] {
           case s: SessionWindow => sessionAttr
         }
 
-        // As same as tumbling window, we add a filter to filter out nulls.
-        // And we also filter out events with negative or zero gap duration.
-        val filterExpr = IsNotNull(session.timeColumn) &&
-          (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+        if (useNewLogic) {
+          def getSum(child: Expression) = {
+            val calendarInterval = IntervalUtils
+              .safeStringToInterval(UTF8String.fromString(child.toString))
+            calendarInterval == null ||
+              calendarInterval.months + calendarInterval.days + calendarInterval.microseconds <= 0
+          }
 
-        replacedPlan.withNewChildren(
-          Filter(filterExpr,
-            Project(sessionStruct +: child.output, child)) :: Nil)
+          // Judge whether all conditions are greater than 0 from the gapDuration
+          val children = gapDuration.child.children
+          val needFilterTimeSize = if (children.size == 0) {
+            getSum(gapDuration.child)
+          } else {
+            children.filter(_.dataType != BooleanType).exists(e =>
+              // The user define function itself is origin, so there is no upward origin
+              e.origin.line.nonEmpty || getSum(e))
+          }
+
+          val filterExpr = if (needFilterTimeSize) {
+            IsNotNull(session.timeColumn) &&
+              (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+          } else {
+            IsNotNull(session.timeColumn)
+          }
+
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        } else {
+          // As same as tumbling window, we add a filter to filter out nulls.
+          // And we also filter out events with negative or zero gap duration.
+          val filterExpr = IsNotNull(session.timeColumn) &&
+            (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        }
       } else if (numWindowExpr > 1) {
         throw QueryCompilationErrors.multiTimeWindowExpressionsNotSupportedError(p)
       } else {
