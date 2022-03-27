@@ -52,13 +52,14 @@ import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTrans
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, StoreAssignmentPolicy}
+import org.apache.spark.sql.internal.SQLConf.{PartitionOverwriteMode, SESSION_WINDOW_NEW_LOGIC, StoreAssignmentPolicy}
 import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType.DAY
 import org.apache.spark.sql.util.{CaseInsensitiveStringMap, SchemaUtils}
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
+import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
  * A trivial [[Analyzer]] with a dummy [[SessionCatalog]], [[EmptyFunctionRegistry]] and
@@ -3991,6 +3992,9 @@ object SessionWindowing extends Rule[LogicalPlan] {
   private final val SESSION_START = "start"
   private final val SESSION_END = "end"
 
+  def apply(plan: LogicalPlan): LogicalPlan =
+    apply0(plan, plan.conf.getConf(SESSION_WINDOW_NEW_LOGIC))
+
   /**
    * Generates the logical plan for generating session window on a timestamp column.
    * Each session window is initially defined as [timestamp, timestamp + gap).
@@ -3998,7 +4002,8 @@ object SessionWindowing extends Rule[LogicalPlan] {
    * This also adds a marker to the session column so that downstream can easily find the column
    * on session window.
    */
-  def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+  def apply0(plan: LogicalPlan,
+             useNewLogic: Boolean): LogicalPlan = plan.resolveOperatorsUp {
     case p: LogicalPlan if p.children.size == 1 =>
       val child = p.children.head
       val sessionExpressions =
@@ -4058,14 +4063,39 @@ object SessionWindowing extends Rule[LogicalPlan] {
           case s: SessionWindow => sessionAttr
         }
 
-        // As same as tumbling window, we add a filter to filter out nulls.
-        // And we also filter out events with negative or zero or invalid gap duration.
-        val filterExpr = IsNotNull(session.timeColumn) &&
-          (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+        if (useNewLogic) {
+          val filterTimeSize = gapDuration.child.dataType match {
+            case CalendarIntervalType =>
+              val calendarInterval =
+                gapDuration.child.asInstanceOf[Literal].value.asInstanceOf[CalendarInterval]
+              calendarInterval == null ||
+                calendarInterval.months + calendarInterval.days + calendarInterval.microseconds <= 0
+            case _ => true
+          }
+          // As same as tumbling window, we add a filter to filter out nulls.
+          // And we also filter out events with negative or zero or invalid gap duration.
+          val filterExpr = if (filterTimeSize) {
+            IsNotNull(session.timeColumn) &&
+              (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+          } else {
+            IsNotNull(session.timeColumn)
+          }
 
-        replacedPlan.withNewChildren(
-          Filter(filterExpr,
-            Project(sessionStruct +: child.output, child)) :: Nil)
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        } else {
+          // As same as tumbling window, we add a filter to filter out nulls.
+          // And we also filter out events with negative or zero or invalid gap duration.
+          val filterExpr = IsNotNull(session.timeColumn) &&
+            (sessionAttr.getField(SESSION_END) > sessionAttr.getField(SESSION_START))
+
+          replacedPlan.withNewChildren(
+            Filter(filterExpr,
+              Project(sessionStruct +: child.output, child)) :: Nil)
+        }
+
+
       } else if (numWindowExpr > 1) {
         throw QueryCompilationErrors.multiTimeWindowExpressionsNotSupportedError(p)
       } else {
